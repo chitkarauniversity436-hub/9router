@@ -1,34 +1,31 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { jwtVerify } from "jose";
+
 import { getSettings } from "@/lib/localDb";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 
+/* -------------------------------------------------------------------------- */
+/*                                   CONFIG                                   */
+/* -------------------------------------------------------------------------- */
+
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+  console.warn("⚠️ JWT_SECRET is not defined. Using insecure fallback secret.");
+}
+
 const SECRET = new TextEncoder().encode(
-  process.env.JWT_SECRET || "9router-default-secret-change-me"
+  JWT_SECRET || "9router-default-secret-change-me"
 );
 
 const CLI_TOKEN_HEADER = "x-9r-cli-token";
 const CLI_TOKEN_SALT = "9r-cli-auth";
 
-let cachedCliToken = null;
-async function getCliToken() {
-  if (!cachedCliToken) cachedCliToken = await getConsistentMachineId(CLI_TOKEN_SALT);
-  return cachedCliToken;
-}
-
-async function hasValidCliToken(request) {
-  const token = request.headers.get(CLI_TOKEN_HEADER);
-  if (!token) return false;
-  return token === await getCliToken();
-}
-
-// Always require JWT token regardless of requireLogin setting
 const ALWAYS_PROTECTED = [
   "/api/shutdown",
   "/api/settings/database",
 ];
 
-// Require auth, but allow through if requireLogin is disabled
 const PROTECTED_API_PATHS = [
   "/api/settings",
   "/api/keys",
@@ -36,9 +33,32 @@ const PROTECTED_API_PATHS = [
   "/api/provider-nodes/validate",
 ];
 
-async function hasValidToken(request) {
-  const token = request.cookies.get("auth_token")?.value;
+const PUBLIC_PATHS = [
+  "/login",
+  "/favicon.ico",
+];
+
+/* -------------------------------------------------------------------------- */
+/*                               CLI TOKEN CACHE                              */
+/* -------------------------------------------------------------------------- */
+
+let cachedCliToken: string | null = null;
+
+async function getCliToken(): Promise<string> {
+  if (!cachedCliToken) {
+    cachedCliToken = await getConsistentMachineId(CLI_TOKEN_SALT);
+  }
+
+  return cachedCliToken;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              AUTH VALIDATION                               */
+/* -------------------------------------------------------------------------- */
+
+async function verifyJwtToken(token?: string | null): Promise<boolean> {
   if (!token) return false;
+
   try {
     await jwtVerify(token, SECRET);
     return true;
@@ -47,90 +67,229 @@ async function hasValidToken(request) {
   }
 }
 
-// Read settings directly from DB to avoid self-fetch deadlock in proxy
-async function loadSettings() {
+async function hasValidJwt(request: NextRequest): Promise<boolean> {
+  const token = request.cookies.get("auth_token")?.value;
+  return verifyJwtToken(token);
+}
+
+async function hasValidCliToken(
+  request: NextRequest
+): Promise<boolean> {
+  const token = request.headers.get(CLI_TOKEN_HEADER);
+
+  if (!token) return false;
+
+  const validToken = await getCliToken();
+
+  return token === validToken;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                SETTINGS LOAD                               */
+/* -------------------------------------------------------------------------- */
+
+type AppSettings = {
+  requireLogin?: boolean;
+  tunnelDashboardAccess?: boolean;
+  tunnelUrl?: string;
+  tailscaleUrl?: string;
+};
+
+async function loadSettings(): Promise<AppSettings | null> {
   try {
     return await getSettings();
-  } catch {
+  } catch (error) {
+    console.error("Failed to load settings:", error);
     return null;
   }
 }
 
-async function isAuthenticated(request) {
-  if (await hasValidToken(request)) return true;
+/* -------------------------------------------------------------------------- */
+/*                             AUTHORIZATION LOGIC                            */
+/* -------------------------------------------------------------------------- */
+
+async function isAuthenticated(
+  request: NextRequest
+): Promise<boolean> {
+  // JWT auth
+  if (await hasValidJwt(request)) {
+    return true;
+  }
+
+  // CLI auth
+  if (await hasValidCliToken(request)) {
+    return true;
+  }
+
+  // Login disabled
   const settings = await loadSettings();
-  if (settings && settings.requireLogin === false) return true;
+
+  if (settings?.requireLogin === false) {
+    return true;
+  }
+
   return false;
 }
 
-export async function proxy(request) {
+/* -------------------------------------------------------------------------- */
+/*                            TUNNEL ACCESS CHECK                             */
+/* -------------------------------------------------------------------------- */
+
+function extractHostname(value?: string): string {
+  if (!value) return "";
+
+  try {
+    return new URL(value).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+async function isTunnelAccessBlocked(
+  request: NextRequest
+): Promise<boolean> {
+  const settings = await loadSettings();
+
+  if (!settings) return false;
+
+  if (settings.tunnelDashboardAccess === true) {
+    return false;
+  }
+
+  const currentHost = (
+    request.headers.get("host") || ""
+  )
+    .split(":")[0]
+    .toLowerCase();
+
+  const tunnelHost = extractHostname(settings.tunnelUrl);
+  const tailscaleHost = extractHostname(settings.tailscaleUrl);
+
+  return (
+    (tunnelHost && currentHost === tunnelHost) ||
+    (tailscaleHost && currentHost === tailscaleHost)
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                MAIN PROXY                                  */
+/* -------------------------------------------------------------------------- */
+
+export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
-  // Always protected - require valid JWT or local CLI token (machineId-based)
-  if (ALWAYS_PROTECTED.some((p) => pathname.startsWith(p))) {
-    if (await hasValidCliToken(request) || await hasValidToken(request))
-      return NextResponse.next();
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  /* -------------------------------- PUBLIC -------------------------------- */
+
+  if (
+    PUBLIC_PATHS.some(
+      (path) => pathname === path || pathname.startsWith(path)
+    )
+  ) {
+    return NextResponse.next();
   }
 
-  // Protect sensitive API endpoints (allow CLI token, JWT, or requireLogin=false)
-  if (PROTECTED_API_PATHS.some((p) => pathname.startsWith(p))) {
-    if (pathname === "/api/settings/require-login") return NextResponse.next();
-    if (await hasValidCliToken(request) || await isAuthenticated(request))
-      return NextResponse.next();
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  /* -------------------------- ALWAYS PROTECTED API ------------------------- */
+
+  if (
+    ALWAYS_PROTECTED.some((path) =>
+      pathname.startsWith(path)
+    )
+  ) {
+    const authorized =
+      (await hasValidJwt(request)) ||
+      (await hasValidCliToken(request));
+
+    if (!authorized) {
+      return NextResponse.json(
+        {
+          error: "Unauthorized",
+          message: "Authentication required",
+        },
+        { status: 401 }
+      );
+    }
+
+    return NextResponse.next();
   }
 
-  // Protect all dashboard routes
+  /* --------------------------- PROTECTED API PATHS ------------------------- */
+
+  if (
+    PROTECTED_API_PATHS.some((path) =>
+      pathname.startsWith(path)
+    )
+  ) {
+    // Public endpoint
+    if (pathname === "/api/settings/require-login") {
+      return NextResponse.next();
+    }
+
+    const authenticated = await isAuthenticated(request);
+
+    if (!authenticated) {
+      return NextResponse.json(
+        {
+          error: "Unauthorized",
+          message: "Authentication required",
+        },
+        { status: 401 }
+      );
+    }
+
+    return NextResponse.next();
+  }
+
+  /* ----------------------------- DASHBOARD AUTH ---------------------------- */
+
   if (pathname.startsWith("/dashboard")) {
-    let requireLogin = true;
-    let tunnelDashboardAccess = true;
-
-    try {
-      const settings = await loadSettings();
-      if (settings) {
-        requireLogin = settings.requireLogin !== false;
-        tunnelDashboardAccess = settings.tunnelDashboardAccess === true;
-
-        // Block tunnel/tailscale access if disabled (redirect to login)
-        if (!tunnelDashboardAccess) {
-          const host = (request.headers.get("host") || "").split(":")[0].toLowerCase();
-          const tunnelHost = settings.tunnelUrl ? new URL(settings.tunnelUrl).hostname.toLowerCase() : "";
-          const tailscaleHost = settings.tailscaleUrl ? new URL(settings.tailscaleUrl).hostname.toLowerCase() : "";
-          if ((tunnelHost && host === tunnelHost) || (tailscaleHost && host === tailscaleHost)) {
-            return NextResponse.redirect(new URL("/login", request.url));
-          }
-        }
-      }
-    } catch {
-      // On error, keep defaults (require login, block tunnel)
+    // Tunnel restrictions
+    if (await isTunnelAccessBlocked(request)) {
+      return NextResponse.redirect(
+        new URL("/login", request.url)
+      );
     }
 
-    // If login not required, allow through
-    if (!requireLogin) return NextResponse.next();
+    const settings = await loadSettings();
 
-    // Verify JWT token
-    const token = request.cookies.get("auth_token")?.value;
-    if (token) {
-      try {
-        await jwtVerify(token, SECRET);
-        return NextResponse.next();
-      } catch {
-        return NextResponse.redirect(new URL("/login", request.url));
-      }
+    // Login disabled
+    if (settings?.requireLogin === false) {
+      return NextResponse.next();
     }
 
-    return NextResponse.redirect(new URL("/login", request.url));
+    // JWT required
+    const validJwt = await hasValidJwt(request);
+
+    if (!validJwt) {
+      const loginUrl = new URL("/login", request.url);
+
+      // preserve intended path
+      loginUrl.searchParams.set("redirect", pathname);
+
+      return NextResponse.redirect(loginUrl);
+    }
+
+    return NextResponse.next();
   }
 
-  // Redirect / to /dashboard if logged in, or /dashboard if it's the root
+  /* ----------------------------- ROOT REDIRECT ----------------------------- */
+
   if (pathname === "/") {
-    return NextResponse.redirect(new URL("/dashboard", request.url));
+    return NextResponse.redirect(
+      new URL("/dashboard", request.url)
+    );
   }
 
   return NextResponse.next();
 }
 
+/* -------------------------------------------------------------------------- */
+/*                                   MATCHER                                  */
+/* -------------------------------------------------------------------------- */
+
 export const config = {
-  matcher: ["/", "/dashboard/:path*"],
+  matcher: [
+    "/",
+    "/dashboard/:path*",
+    "/api/:path*",
+  ],
 };
