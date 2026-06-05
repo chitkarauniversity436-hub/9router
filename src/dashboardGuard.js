@@ -11,7 +11,9 @@ import { getConsistentMachineId } from "@/shared/utils/machineId";
 const JWT_SECRET = process.env.JWT_SECRET;
 
 if (!JWT_SECRET) {
-  console.warn("⚠️ JWT_SECRET is not defined. Using insecure fallback secret.");
+  console.warn(
+    "JWT_SECRET is not defined. Using insecure fallback secret."
+  );
 }
 
 const SECRET = new TextEncoder().encode(
@@ -24,19 +26,19 @@ const CLI_TOKEN_SALT = "9r-cli-auth";
 const ALWAYS_PROTECTED = [
   "/api/shutdown",
   "/api/settings/database",
-];
+] as const;
 
 const PROTECTED_API_PATHS = [
   "/api/settings",
   "/api/keys",
   "/api/providers/client",
   "/api/provider-nodes/validate",
-];
+] as const;
 
 const PUBLIC_PATHS = [
   "/login",
   "/favicon.ico",
-];
+] as const;
 
 /* -------------------------------------------------------------------------- */
 /*                               CLI TOKEN CACHE                              */
@@ -46,7 +48,9 @@ let cachedCliToken: string | null = null;
 
 async function getCliToken(): Promise<string> {
   if (!cachedCliToken) {
-    cachedCliToken = await getConsistentMachineId(CLI_TOKEN_SALT);
+    cachedCliToken = await getConsistentMachineId(
+      CLI_TOKEN_SALT
+    );
   }
 
   return cachedCliToken;
@@ -56,8 +60,12 @@ async function getCliToken(): Promise<string> {
 /*                              AUTH VALIDATION                               */
 /* -------------------------------------------------------------------------- */
 
-async function verifyJwtToken(token?: string | null): Promise<boolean> {
-  if (!token) return false;
+async function verifyJwtToken(
+  token?: string | null
+): Promise<boolean> {
+  if (!token?.trim()) {
+    return false;
+  }
 
   try {
     await jwtVerify(token, SECRET);
@@ -67,17 +75,25 @@ async function verifyJwtToken(token?: string | null): Promise<boolean> {
   }
 }
 
-async function hasValidJwt(request: NextRequest): Promise<boolean> {
-  const token = request.cookies.get("auth_token")?.value;
+async function hasValidJwt(
+  request: NextRequest
+): Promise<boolean> {
+  const token =
+    request.cookies.get("auth_token")?.value;
+
   return verifyJwtToken(token);
 }
 
 async function hasValidCliToken(
   request: NextRequest
 ): Promise<boolean> {
-  const token = request.headers.get(CLI_TOKEN_HEADER);
+  const token = request.headers.get(
+    CLI_TOKEN_HEADER
+  );
 
-  if (!token) return false;
+  if (!token) {
+    return false;
+  }
 
   const validToken = await getCliToken();
 
@@ -99,9 +115,45 @@ async function loadSettings(): Promise<AppSettings | null> {
   try {
     return await getSettings();
   } catch (error) {
-    console.error("Failed to load settings:", error);
+    console.error(
+      "Failed to load settings:",
+      error
+    );
     return null;
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              HELPER FUNCTIONS                              */
+/* -------------------------------------------------------------------------- */
+
+function unauthorizedResponse() {
+  return NextResponse.json(
+    {
+      error: "Unauthorized",
+      message: "Authentication required",
+    },
+    { status: 401 }
+  );
+}
+
+function matchesPath(
+  pathname: string,
+  paths: readonly string[]
+): boolean {
+  return paths.some((path) =>
+    pathname.startsWith(path)
+  );
+}
+
+function isPublicPath(
+  pathname: string
+): boolean {
+  return PUBLIC_PATHS.some(
+    (path) =>
+      pathname === path ||
+      pathname.startsWith(path)
+  );
 }
 
 /* -------------------------------------------------------------------------- */
@@ -111,17 +163,14 @@ async function loadSettings(): Promise<AppSettings | null> {
 async function isAuthenticated(
   request: NextRequest
 ): Promise<boolean> {
-  // JWT auth
   if (await hasValidJwt(request)) {
     return true;
   }
 
-  // CLI auth
   if (await hasValidCliToken(request)) {
     return true;
   }
 
-  // Login disabled
   const settings = await loadSettings();
 
   if (settings?.requireLogin === false) {
@@ -135,8 +184,12 @@ async function isAuthenticated(
 /*                            TUNNEL ACCESS CHECK                             */
 /* -------------------------------------------------------------------------- */
 
-function extractHostname(value?: string): string {
-  if (!value) return "";
+function extractHostname(
+  value?: string
+): string {
+  if (!value) {
+    return "";
+  }
 
   try {
     return new URL(value).hostname.toLowerCase();
@@ -150,7 +203,9 @@ async function isTunnelAccessBlocked(
 ): Promise<boolean> {
   const settings = await loadSettings();
 
-  if (!settings) return false;
+  if (!settings) {
+    return false;
+  }
 
   if (settings.tunnelDashboardAccess === true) {
     return false;
@@ -162,12 +217,19 @@ async function isTunnelAccessBlocked(
     .split(":")[0]
     .toLowerCase();
 
-  const tunnelHost = extractHostname(settings.tunnelUrl);
-  const tailscaleHost = extractHostname(settings.tailscaleUrl);
+  const tunnelHost = extractHostname(
+    settings.tunnelUrl
+  );
+
+  const tailscaleHost = extractHostname(
+    settings.tailscaleUrl
+  );
 
   return (
-    (tunnelHost && currentHost === tunnelHost) ||
-    (tailscaleHost && currentHost === tailscaleHost)
+    (tunnelHost &&
+      currentHost === tunnelHost) ||
+    (tailscaleHost &&
+      currentHost === tailscaleHost)
   );
 }
 
@@ -175,38 +237,26 @@ async function isTunnelAccessBlocked(
 /*                                MAIN PROXY                                  */
 /* -------------------------------------------------------------------------- */
 
-export async function proxy(request: NextRequest) {
+export async function proxy(
+  request: NextRequest
+) {
   const { pathname } = request.nextUrl;
 
   /* -------------------------------- PUBLIC -------------------------------- */
 
-  if (
-    PUBLIC_PATHS.some(
-      (path) => pathname === path || pathname.startsWith(path)
-    )
-  ) {
+  if (isPublicPath(pathname)) {
     return NextResponse.next();
   }
 
   /* -------------------------- ALWAYS PROTECTED API ------------------------- */
 
-  if (
-    ALWAYS_PROTECTED.some((path) =>
-      pathname.startsWith(path)
-    )
-  ) {
+  if (matchesPath(pathname, ALWAYS_PROTECTED)) {
     const authorized =
       (await hasValidJwt(request)) ||
       (await hasValidCliToken(request));
 
     if (!authorized) {
-      return NextResponse.json(
-        {
-          error: "Unauthorized",
-          message: "Authentication required",
-        },
-        { status: 401 }
-      );
+      return unauthorizedResponse();
     }
 
     return NextResponse.next();
@@ -215,25 +265,22 @@ export async function proxy(request: NextRequest) {
   /* --------------------------- PROTECTED API PATHS ------------------------- */
 
   if (
-    PROTECTED_API_PATHS.some((path) =>
-      pathname.startsWith(path)
+    matchesPath(
+      pathname,
+      PROTECTED_API_PATHS
     )
   ) {
+    
     // Public endpoint
-    if (pathname === "/api/settings/require-login") {
+    if (
+      pathname ===
+      "/api/settings/require-login"
+    ) {
       return NextResponse.next();
     }
 
-    const authenticated = await isAuthenticated(request);
-
-    if (!authenticated) {
-      return NextResponse.json(
-        {
-          error: "Unauthorized",
-          message: "Authentication required",
-        },
-        { status: 401 }
-      );
+    if (!(await isAuthenticated(request))) {
+      return unauthorizedResponse();
     }
 
     return NextResponse.next();
@@ -242,30 +289,37 @@ export async function proxy(request: NextRequest) {
   /* ----------------------------- DASHBOARD AUTH ---------------------------- */
 
   if (pathname.startsWith("/dashboard")) {
-    // Tunnel restrictions
-    if (await isTunnelAccessBlocked(request)) {
+    if (
+      await isTunnelAccessBlocked(request)
+    ) {
       return NextResponse.redirect(
         new URL("/login", request.url)
       );
     }
 
-    const settings = await loadSettings();
+    const settings =
+      await loadSettings();
 
-    // Login disabled
-    if (settings?.requireLogin === false) {
+    if (
+      settings?.requireLogin === false
+    ) {
       return NextResponse.next();
     }
 
-    // JWT required
-    const validJwt = await hasValidJwt(request);
+    if (!(await hasValidJwt(request))) {
+      const loginUrl = new URL(
+        "/login",
+        request.url
+      );
 
-    if (!validJwt) {
-      const loginUrl = new URL("/login", request.url);
+      loginUrl.searchParams.set(
+        "redirect",
+        pathname
+      );
 
-      // preserve intended path
-      loginUrl.searchParams.set("redirect", pathname);
-
-      return NextResponse.redirect(loginUrl);
+      return NextResponse.redirect(
+        loginUrl
+      );
     }
 
     return NextResponse.next();
